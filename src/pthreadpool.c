@@ -4,12 +4,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <limits.h>
 
 /* POSIX headers */
 #include <pthread.h>
 #include <unistd.h>
 
-/* Dependencies */
 #include <fxdiv.h>
 
 /* Library header */
@@ -61,30 +61,21 @@ enum thread_state {
 
 struct PTHREADPOOL_CACHELINE_ALIGNED thread_info {
 	/**
-	 * Index of the first element in the work range.
-	 * Before processing a new element the owning worker thread increments this value.
+         * The next index of the item that the worker will work on.
 	 */
-	volatile size_t range_start;
+	volatile size_t next_index;
 	/**
-	 * Index of the element after the last element of the work range.
-	 * Before processing a new element the stealing worker thread decrements this value.
+         * The total number of items that need to be processed by all threads.
 	 */
-	volatile size_t range_end;
-	/**
-	 * The number of elements in the work range.
-	 * Due to race conditions range_length <= range_end - range_start.
-	 * The owning worker thread must decrement this value before incrementing @a range_start.
-	 * The stealing worker thread must decrement this value before decrementing @a range_end.
+	volatile size_t items_count;
+        /**
+	 * Thread id in the 0..threads_count-1 range.
 	 */
-	volatile size_t range_length;
+	size_t thread_id;
 	/**
 	 * The active state of the thread.
 	 */
 	volatile enum thread_state state;
-	/**
-	 * Thread number in the 0..threads_count-1 range.
-	 */
-	size_t thread_number;
 	/**
 	 * The pthread object corresponding to the thread.
 	 */
@@ -183,31 +174,43 @@ inline static bool atomic_decrement(volatile size_t* value) {
 	return actual_value != 0;
 }
 
+#define FETCH_ADD(ptr, n) __sync_fetch_and_add(ptr, n)
+
+static size_t steal(struct pthreadpool* threadpool) {
+        size_t tid = 0, mintid = 0, nextitemindex = 0, minitemindex = LONG_MAX;
+        for (; tid < threadpool->threads_count; ++tid) {
+                if (threadpool->threads[tid].state != thread_state_idle && minitemindex > threadpool->threads[tid].next_index) {
+                        minitemindex = threadpool->threads[tid].next_index;
+                        mintid = tid;
+                }
+        }
+        return FETCH_ADD(&(threadpool->threads[mintid].next_index), threadpool->threads_count);
+}
+
+// improve the work stealing algorithm
 static void thread_compute_1d(struct pthreadpool* threadpool, struct thread_info* thread) {
 	const pthreadpool_function_1d_t function = (pthreadpool_function_1d_t) threadpool->function;
 	void *const argument = threadpool->argument;
 	/* Process thread's own range of items */
-	size_t range_start = thread->range_start;
-	while (atomic_decrement(&thread->range_length)) {
-		function(argument, range_start++);
-	}
-	/* Done, now look for other threads' items to steal */
-	const size_t thread_number = thread->thread_number;
-	const size_t threads_count = threadpool->threads_count;
-	for (size_t tid = (thread_number + 1) % threads_count; tid != thread_number; tid = (tid + 1) % threads_count) {
-		struct thread_info* other_thread = &threadpool->threads[tid];
-		if (other_thread->state != thread_state_idle) {
-			while (atomic_decrement(&other_thread->range_length)) {
-				const size_t item_id = __sync_sub_and_fetch(&other_thread->range_end, 1);
-				function(argument, item_id);
-			}
-		}
-	}
+        const size_t threads_count = threadpool->threads_count;
+        const size_t items_count = thread->items_count;
+        
+	volatile size_t* ptr_index = &(thread->next_index);
+
+        for (size_t index = FETCH_ADD(ptr_index, threads_count); index < items_count; index = FETCH_ADD(ptr_index, threads_count)) {
+                function(argument, index);
+        }
+
+        /* Steal work from other threads */
+        for (size_t index = steal(threadpool); index < items_count; index = steal(threadpool)) {
+                function(argument, index);
+        }
 }
+
 
 static void* thread_main(void* arg) {
 	struct thread_info* thread = (struct thread_info*) arg;
-	struct pthreadpool* threadpool = ((struct pthreadpool*) (thread - thread->thread_number)) - 1;
+	struct pthreadpool* threadpool = ((struct pthreadpool*) (thread - thread->thread_id)) - 1;
 
 	/* Check in */
 	checkin_worker_thread(threadpool);
@@ -266,7 +269,8 @@ struct pthreadpool* pthreadpool_create(size_t threads_count) {
 	pthread_cond_init(&threadpool->state_condvar, NULL);
 
 	for (size_t tid = 0; tid < threads_count; tid++) {
-		threadpool->threads[tid].thread_number = tid;
+		threadpool->threads[tid].thread_id = tid;
+		threadpool->threads[tid].next_index = tid;
 		pthread_create(&threadpool->threads[tid].thread_object, NULL, &thread_main, &threadpool->threads[tid]);
 	}
 
@@ -298,15 +302,14 @@ void pthreadpool_compute_1d(
 		pthread_mutex_lock(&threadpool->state_mutex);
 
 		/* Setup global arguments */
-		threadpool->function = function;
+		threadpool->function = (void *)function;
 		threadpool->argument = argument;
 
 		/* Spread the work between threads */
 		for (size_t tid = 0; tid < threadpool->threads_count; tid++) {
 			struct thread_info* thread = &threadpool->threads[tid];
-			thread->range_start = multiply_divide(range, tid, threadpool->threads_count);
-			thread->range_end = multiply_divide(range, tid + 1, threadpool->threads_count);
-			thread->range_length = thread->range_end - thread->range_start;
+                        thread->items_count = range;
+                        thread->next_index = tid;
 			thread->state = thread_state_compute_1d;
 		}
 
