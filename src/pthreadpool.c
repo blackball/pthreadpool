@@ -187,7 +187,6 @@ static size_t steal(struct pthreadpool* threadpool) {
         return FETCH_ADD(&(threadpool->threads[mintid].next_index), threadpool->threads_count);
 }
 
-// improve the work stealing algorithm
 static void thread_compute_1d(struct pthreadpool* threadpool, struct thread_info* thread) {
 	const pthreadpool_function_1d_t function = (pthreadpool_function_1d_t) threadpool->function;
 	void *const argument = threadpool->argument;
@@ -206,7 +205,6 @@ static void thread_compute_1d(struct pthreadpool* threadpool, struct thread_info
                 function(argument, index);
         }
 }
-
 
 static void* thread_main(void* arg) {
 	struct thread_info* thread = (struct thread_info*) arg;
