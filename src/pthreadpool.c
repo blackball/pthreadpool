@@ -161,19 +161,6 @@ static void wakeup_worker_threads(struct pthreadpool* threadpool) {
 	pthread_mutex_unlock(&threadpool->state_mutex); /* Do wake up */
 }
 
-inline static bool atomic_decrement(volatile size_t* value) {
-	size_t actual_value = *value;
-	if (actual_value != 0) {
-		size_t expected_value;
-		do {
-			expected_value = actual_value;
-			const size_t new_value = actual_value - 1;
-			actual_value = __sync_val_compare_and_swap(value, expected_value, new_value);
-		} while ((actual_value != expected_value) && (actual_value != 0));
-	}
-	return actual_value != 0;
-}
-
 #define FETCH_ADD(ptr, n) __sync_fetch_and_add(ptr, n)
 
 static size_t steal(struct pthreadpool* threadpool) {
